@@ -9,30 +9,28 @@ from prophet import Prophet
 from sklearn.metrics import mean_absolute_error
 import asyncio
 import warnings
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
 warnings.filterwarnings('ignore')
 
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "database": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "port": os.getenv("DB_PORT")
+    "host": "localhost",
+    "database": "postgres",
+    "user": "postgres", 
+    "password": "12345",
+    "port": "5432"
 }
 
 class ForecastApp:
     def __init__(self):
         self.df_years = pd.DataFrame()
         self.df_sales = pd.DataFrame()
+        self.df_directions = pd.DataFrame()
+        self.direction_coefficients = {}
         self.monthly_df = None
         self.weekly_df = None
         self.daily_df = None
         self.years_table = None
         self.forecast_table = None
+        self.direction_forecast_table = None
         self.progress_bar = None
         self.progress_text = None
         self.create_ui()
@@ -46,7 +44,7 @@ class ForecastApp:
             return None
     
     def load_years_data(self):
-        """Загрузка данных по годам из division_results"""
+        """Загрузка данных по годам из division_results (сохраняем копейки)"""
         conn = self.get_db_connection()
         if not conn:
             return pd.DataFrame()
@@ -61,23 +59,158 @@ class ForecastApp:
             order by year
             """
             df = pd.read_sql(query, conn)
-
-            # Явно конвертируем в Decimal для сохранения точности
-            from decimal import Decimal
-            df['plan'] = df['plan'].apply(lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0'))
-            df['fact'] = df['fact'].apply(lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0'))
-            
-            # Округляем до 2 знаков после запятой
-            # for col in ['plan', 'fact']:
-                # if col in df.columns:
-                    # df[col] = df[col].round(2)
-            
             return df
         except Exception as e:
             ui.notify(f'Ошибка загрузки данных по годам: {e}', type='negative')
             return pd.DataFrame()
         finally:
             conn.close()
+    
+    def load_directions_data(self):
+        """Загрузка данных по товарным направлениям"""
+        conn = self.get_db_connection()
+        if not conn:
+            return pd.DataFrame()
+        
+        try:
+            query = """
+            SELECT 
+                year,
+                direction,
+                total_amount_actual as actual,
+                total_amount_plan as plan
+            FROM kamtent.yearly_division_results
+            ORDER BY year, direction
+            """
+            df = pd.read_sql(query, conn)
+            return df
+        except Exception as e:
+            ui.notify(f'Ошибка загрузки данных по направлениям: {e}', type='negative')
+            return pd.DataFrame()
+        finally:
+            conn.close()
+    
+    def calculate_direction_coefficients(self, target_year):
+        """Расчет средних коэффициентов по направлениям на основе всех годов до target_year - 2"""
+        if self.df_directions.empty:
+            self.df_directions = self.load_directions_data()
+        
+        if self.df_directions.empty:
+            return {}
+        
+        # Берем все годы, которые меньше или равны target_year - 2
+        max_year = target_year - 2
+        years = sorted([y for y in self.df_directions['year'].unique() if y <= max_year])
+        
+        # Если данных нет, берем последние доступные годы
+        if not years:
+            years = sorted(self.df_directions['year'].unique())[-3:]
+        
+        print(f"\n{'='*60}")
+        print(f"Расчет средних коэффициентов на основе годов: {years}")
+        print(f"(все годы до {max_year}, включительно)")
+        print(f"{'='*60}")
+        
+        # Собираем коэффициенты по каждому году
+        all_coefficients = {}
+        
+        for year in years:
+            df_year = self.df_directions[self.df_directions['year'] == year]
+            year_totals = df_year.groupby('direction')['actual'].sum()
+            year_total = year_totals.sum()
+            
+            if year_total > 0:
+                print(f"\n{year} год:")
+                print("-" * 40)
+                for direction, total in year_totals.items():
+                    coef = total / year_total
+                    print(f"  {direction}: {coef:.6f} ({coef*100:.2f}%)")
+                    
+                    if direction not in all_coefficients:
+                        all_coefficients[direction] = []
+                    all_coefficients[direction].append(coef)
+        
+        # Рассчитываем средние коэффициенты
+        coefficients = {}
+        print(f"\n{'='*60}")
+        print(f"СРЕДНИЕ КОЭФФИЦИЕНТЫ за {len(years)} лет ({years[0]}-{years[-1]}):")
+        print(f"{'='*60}")
+        
+        for direction, coef_list in all_coefficients.items():
+            avg_coef = sum(coef_list) / len(coef_list)
+            coefficients[direction] = avg_coef
+            print(f"  {direction}: {avg_coef:.6f} ({avg_coef*100:.2f}%)")
+            print(f"    Диапазон: {min(coef_list):.6f} - {max(coef_list):.6f}")
+        
+        # Выводим общую сумму коэффициентов для проверки
+        total_coef = sum(coefficients.values())
+        print(f"\nСумма коэффициентов: {total_coef:.6f}")
+        
+        # Нормализуем, если сумма не равна 1
+        if abs(total_coef - 1.0) > 0.0001:
+            print(f"ВНИМАНИЕ: Сумма коэффициентов = {total_coef:.6f}, выполняем нормализацию...")
+            for direction in coefficients:
+                coefficients[direction] = coefficients[direction] / total_coef
+            
+            print("\nПосле нормализации:")
+            for direction, coef in coefficients.items():
+                print(f"  {direction}: {coef:.6f} ({coef*100:.2f}%)")
+        
+        return coefficients
+    
+    def split_forecast_by_directions(self, monthly_forecast, target_year):
+        """Разбивка помесячного прогноза по направлениям"""
+        coefficients = self.calculate_direction_coefficients(target_year)
+        
+        if not coefficients:
+            ui.notify('Нет данных по направлениям для разбивки прогноза', type='warning')
+            return None
+        
+        # Создаем DataFrame с разбивкой по месяцам и направлениям
+        result = []
+        
+        for _, row in monthly_forecast.iterrows():
+            month = row['month']
+            total = row['forecast']
+            
+            # Разбиваем без округления
+            forecast_values = {}
+            for direction, coef in coefficients.items():
+                forecast_values[direction] = total * coef
+            
+            # Округляем до тысяч, но не теряем малые суммы
+            rounded_values = {}
+            remaining = total
+            
+            # Сначала округляем все направления, кроме последнего
+            directions_list = list(coefficients.keys())
+            for i, direction in enumerate(directions_list[:-1]):
+                rounded = max(1000, round(forecast_values[direction] / 1000) * 1000)
+                rounded_values[direction] = rounded
+                remaining -= rounded
+            
+            # Последнее направление получает остаток
+            last_direction = directions_list[-1]
+            rounded_values[last_direction] = max(0, remaining)
+            
+            # Добавляем в результат
+            for direction, value in rounded_values.items():
+                result.append({
+                    'month': month,
+                    'direction': direction,
+                    'forecast': value
+                })
+        
+        result_df = pd.DataFrame(result)
+        
+        # Выводим проверку сходимости
+        print("\nПроверка сходимости сумм после корректировки:")
+        for month_num in range(1, 13):
+            month_total = monthly_forecast[monthly_forecast['month'].dt.month == month_num]['forecast'].sum()
+            directions_sum = result_df[result_df['month'].dt.month == month_num]['forecast'].sum()
+            print(f"  Месяц {month_num}: прогноз={month_total:,.0f}, сумма по направлениям={directions_sum:,.0f}, разница={month_total - directions_sum:,.0f}")
+        
+        return result_df
     
     def load_sales_data(self):
         """Загрузка данных о продажах для прогнозирования"""
@@ -155,16 +288,12 @@ class ForecastApp:
     def round_amount(self, amount, precision='hundreds_thousands'):
         """Округление суммы до нужной точности"""
         if precision == 'hundreds_thousands':
-            # Округление до сотен тысяч (100 000)
             return round(amount / 100000) * 100000
         elif precision == 'tens_thousands':
-            # Округление до десятков тысяч (10 000)
             return round(amount / 10000) * 10000
         elif precision == 'thousands':
-            # Округление до тысяч (1 000)
             return round(amount / 1000) * 1000
         else:
-            # Округление до сотых (0.01)
             return round(amount, 2)
     
     async def update_progress(self, value, text):
@@ -173,7 +302,7 @@ class ForecastApp:
             self.progress_bar.set_value(value)
         if self.progress_text:
             self.progress_text.set_text(text)
-        await asyncio.sleep(0.1)  # Небольшая задержка для обновления UI
+        await asyncio.sleep(0.1)
     
     def forecast_for_year(self, data, agg_level, target_year, min_monthly=2100000):
         """Прогнозирование на указанный год с разными уровнями агрегации"""
@@ -189,21 +318,17 @@ class ForecastApp:
     
     def forecast_monthly(self, df, target_year, min_monthly):
         """Прогноз на основе месячных данных (упрощенный)"""
-        # Разделение на train/test
         train = df[df.index <= f'{target_year-1}-12-31']
         
-        if len(train) < 12:  # Уменьшаем требование до 1 года
+        if len(train) < 12:
             return self.fallback_forecast(train, target_year, min_monthly, 'monthly')
         
         models = {}
         
-        # Используем только простые модели для надежности
-        
-        # Простое скользящее среднее (всегда работает)
+        # Простое скользящее среднее
         try:
             last_12 = train.tail(12)['Sales'].values
             if len(last_12) >= 6:
-                # Используем среднее за последние 6 месяцев с учетом сезонности
                 seasonal_factors = []
                 for i in range(1, 13):
                     same_month_data = train[train.index.month == i]['Sales'].tail(3)
@@ -212,7 +337,6 @@ class ForecastApp:
                     else:
                         seasonal_factors.append(1.0)
                 
-                # Нормализуем факторы
                 seasonal_factors = np.array(seasonal_factors)
                 seasonal_factors = seasonal_factors / seasonal_factors.mean() * 1.0
                 
@@ -222,7 +346,7 @@ class ForecastApp:
         except Exception as e:
             print(f"Seasonal MA failed: {e}")
         
-        # Holt-Winters (упрощенный)
+        # Holt-Winters
         try:
             train_values = train['Sales'].bfill().ffill()
             if len(train_values) >= 12:
@@ -239,7 +363,7 @@ class ForecastApp:
         except Exception as e:
             print(f"Holt-Winters failed: {e}")
         
-        # Prophet (упрощенный)
+        # Prophet
         try:
             prophet_df = train.reset_index()[['Date', 'Sales']]
             prophet_df.columns = ['ds', 'y']
@@ -257,25 +381,19 @@ class ForecastApp:
         except Exception as e:
             print(f"Prophet failed: {e}")
         
-        # Если есть хотя бы одна модель, используем её
         if models:
             if len(models) > 1:
-                # Если есть несколько моделей, используем среднее
                 ensemble = pd.DataFrame(models).mean(axis=1)
                 forecast = ensemble
                 model_name = 'Ensemble'
             else:
-                # Используем единственную модель
                 model_name = list(models.keys())[0]
                 forecast = models[model_name]
             
-            # Применяем минимальный порог и округление
             forecast = [max(float(x), min_monthly) for x in forecast]
         else:
-            # Если все модели не сработали, используем fallback
             return self.fallback_forecast(train, target_year, min_monthly, 'monthly')
         
-        # Создаем DataFrame с прогнозом
         forecast_dates = pd.date_range(start=f'{target_year}-01-31', periods=12, freq='ME')
         
         forecast_df = pd.DataFrame({
@@ -283,7 +401,10 @@ class ForecastApp:
             'forecast': forecast
         })
         
-        # Добавляем статистику с округлением
+        forecast_df['forecast'] = forecast_df['forecast'].apply(
+            lambda x: self.round_amount(x, 'hundreds_thousands')
+        )
+        
         stats = {
             'total_forecast': self.round_amount(sum(forecast_df['forecast']), 'hundreds_thousands'),
             'avg_monthly': self.round_amount(np.mean(forecast_df['forecast']), 'hundreds_thousands'),
@@ -292,53 +413,42 @@ class ForecastApp:
             'model_used': model_name
         }
         
-        # Округляем сам прогноз
-        forecast_df['forecast'] = forecast_df['forecast'].apply(
-            lambda x: self.round_amount(x, 'hundreds_thousands')
-        )
-        
         return forecast_df, stats
     
     def forecast_weekly_optimized(self, df, target_year, min_monthly):
         """Оптимизированный прогноз на основе недельных данных"""
-        
-        # Разделение на train/test
         train = df[df.index <= f'{target_year-1}-12-31']
         
-        if len(train) < 26:  # Уменьшаем требование до 26 недель (полгода)
+        if len(train) < 26:
             return self.fallback_forecast(train, target_year, min_monthly, 'weekly')
         
         models = {}
         
-        # Используем только Holt-Winters и Prophet (SARIMA слишком тяжелая для недельных данных)
-        
-        # Holt-Winters (оптимизированный)
+        # Holt-Winters
         try:
             train_values = train['Sales'].bfill().ffill()
-            # Упрощаем модель для ускорения
             hw_model = ExponentialSmoothing(
                 train_values, 
                 trend='add', 
                 seasonal='add',
-                seasonal_periods=13,  # Уменьшаем период до 13 недель (квартал)
+                seasonal_periods=13,
                 damped_trend=True
             )
             hw_fit = hw_model.fit()
-            hw_forecast = hw_fit.forecast(26)  # Прогноз на 26 недель (полгода)
+            hw_forecast = hw_fit.forecast(26)
             models['Holt-Winters'] = hw_forecast
         except Exception as e:
             print(f"Holt-Winters failed: {e}")
         
-        # Prophet (оптимизированный)
+        # Prophet
         try:
             prophet_df = train.reset_index().rename(columns={'pay_date': 'ds', 'Sales': 'y'})
             prophet_df['y'] = prophet_df['y'].bfill().ffill()
-            # Упрощаем модель Prophet
             prophet_model = Prophet(
                 seasonality_mode='multiplicative',
                 yearly_seasonality=True,
-                weekly_seasonality=False,  # Отключаем недельную сезонность для ускорения
-                seasonality_prior_scale=0.1  # Уменьшаем сложность
+                weekly_seasonality=False,
+                seasonality_prior_scale=0.1
             )
             prophet_model.fit(prophet_df)
             future = prophet_model.make_future_dataframe(periods=26, freq='W-MON')
@@ -347,42 +457,28 @@ class ForecastApp:
         except Exception as e:
             print(f"Prophet failed: {e}")
         
-        # Если есть хотя бы одна модель, используем её
         if models:
             if len(models) > 1:
-                # Если есть несколько моделей, используем среднее
                 ensemble = pd.DataFrame(models).mean(axis=1)
                 weekly_forecast = ensemble
                 model_name = 'Ensemble'
             else:
-                # Используем единственную модель
                 model_name = list(models.keys())[0]
                 weekly_forecast = models[model_name]
         else:
             return self.fallback_forecast(train, target_year, min_monthly, 'weekly')
         
-        # Интерполируем прогноз до 52 недель
         if len(weekly_forecast) < 52:
-            # Создаем индексы для интерполяции
             x_old = np.linspace(0, 1, len(weekly_forecast))
             x_new = np.linspace(0, 1, 52)
             weekly_forecast_full = np.interp(x_new, x_old, weekly_forecast)
         else:
             weekly_forecast_full = weekly_forecast[:52]
         
-        # Конвертируем недельный прогноз в месячный
         forecast_dates = pd.date_range(start=f'{target_year}-01-05', periods=52, freq='W-MON')
-        
-        forecast_df = pd.DataFrame({
-            'Date': forecast_dates,
-            'Forecast': weekly_forecast_full
-        })
-        
-        # Агрегация по месяцам
+        forecast_df = pd.DataFrame({'Date': forecast_dates, 'Forecast': weekly_forecast_full})
         forecast_df.set_index('Date', inplace=True)
         monthly_forecast = forecast_df.resample('ME')['Forecast'].sum()
-        
-        # Применяем минимальный порог к месяцам
         monthly_forecast = [max(x, min_monthly) for x in monthly_forecast]
         
         forecast_dates_monthly = pd.date_range(start=f'{target_year}-01-31', periods=12, freq='ME')
@@ -392,7 +488,6 @@ class ForecastApp:
             'forecast': monthly_forecast
         })
         
-        # Округляем до сотен тысяч
         result_df['forecast'] = result_df['forecast'].apply(
             lambda x: self.round_amount(x, 'hundreds_thousands')
         )
@@ -409,20 +504,12 @@ class ForecastApp:
     
     def forecast_daily(self, df, target_year, min_monthly):
         """Прогноз на основе ежедневных данных с агрегацией в месячные"""
-        # Определяем количество дней в году
         days_in_year = 366 if (target_year % 4 == 0 and (target_year % 100 != 0 or target_year % 400 == 0)) else 365
-        
-        # Разделение на train/test
         train = df[df.index <= f'{target_year-1}-12-31']
         
-        if len(train) < 180:  # Уменьшаем требование до 180 дней (полгода)
+        if len(train) < 180:
             return self.fallback_forecast(train, target_year, min_monthly, 'daily')
         
-        models = {}
-        
-        # Используем только Prophet для дневных данных (остальные слишком тяжелые)
-        
-        # Prophet
         try:
             prophet_df = train.reset_index()[['pay_date','Sales']].rename(
                 columns={'pay_date':'ds','Sales':'y'}
@@ -435,38 +522,21 @@ class ForecastApp:
                 seasonality_prior_scale=0.1
             )
             prophet_model.fit(prophet_df)
-            future = prophet_model.make_future_dataframe(periods=min(days_in_year, 90), freq='D')  # Ограничиваем прогноз 90 днями
-            prophet_forecast = prophet_model.predict(future)['yhat'][-min(days_in_year, 90):].values
-            models['Prophet'] = prophet_forecast
-        except Exception as e:
-            print(f"Prophet failed: {e}")
-        
-        # Если есть модель, используем её
-        if models:
-            daily_forecast = models['Prophet']
-            model_name = 'Prophet'
+            future = prophet_model.make_future_dataframe(periods=min(days_in_year, 90), freq='D')
+            daily_forecast = prophet_model.predict(future)['yhat'][-min(days_in_year, 90):].values
             
-            # Если прогноз короче, чем нужно, интерполируем
             if len(daily_forecast) < days_in_year:
                 x_old = np.linspace(0, 1, len(daily_forecast))
                 x_new = np.linspace(0, 1, days_in_year)
                 daily_forecast = np.interp(x_new, x_old, daily_forecast)
-        else:
+        except Exception as e:
+            print(f"Prophet failed: {e}")
             return self.fallback_forecast(train, target_year, min_monthly, 'daily')
         
-        # Конвертируем дневной прогноз в месячный
         forecast_dates = pd.date_range(start=f'{target_year}-01-01', periods=days_in_year, freq='D')
-        
-        forecast_df = pd.DataFrame({
-            'Date': forecast_dates,
-            'Forecast': daily_forecast[:days_in_year]
-        })
-        
-        # Агрегация по месяцам
+        forecast_df = pd.DataFrame({'Date': forecast_dates, 'Forecast': daily_forecast[:days_in_year]})
         forecast_df.set_index('Date', inplace=True)
         monthly_forecast = forecast_df.resample('ME')['Forecast'].sum()
-        
-        # Применяем минимальный порог к месяцам
         monthly_forecast = [max(x, min_monthly) for x in monthly_forecast]
         
         forecast_dates_monthly = pd.date_range(start=f'{target_year}-01-31', periods=12, freq='ME')
@@ -476,7 +546,6 @@ class ForecastApp:
             'forecast': monthly_forecast
         })
         
-        # Округляем до сотен тысяч
         result_df['forecast'] = result_df['forecast'].apply(
             lambda x: self.round_amount(x, 'hundreds_thousands')
         )
@@ -486,23 +555,20 @@ class ForecastApp:
             'avg_monthly': self.round_amount(np.mean(result_df['forecast']), 'hundreds_thousands'),
             'min_month': self.round_amount(min(result_df['forecast']), 'hundreds_thousands'),
             'max_month': self.round_amount(max(result_df['forecast']), 'hundreds_thousands'),
-            'model_used': f"{model_name} (daily-based)"
+            'model_used': "Prophet (daily-based)"
         }
         
         return result_df, stats
     
     def fallback_forecast(self, train, target_year, min_monthly, agg_level):
-        """Запасной метод прогнозирования, если основные модели не работают"""
+        """Запасной метод прогнозирования"""
         if len(train) > 0:
-            # Используем среднее за последние 12 месяцев
             last_values = train.tail(12)['Sales']
             avg_monthly = last_values.mean() if len(last_values) > 0 else min_monthly * 1.5
         else:
             avg_monthly = min_monthly * 1.5
         
-        # Применяем минимальный порог
         monthly_forecast = [max(avg_monthly, min_monthly)] * 12
-        
         forecast_dates = pd.date_range(start=f'{target_year}-01-31', periods=12, freq='ME')
         
         result_df = pd.DataFrame({
@@ -510,7 +576,6 @@ class ForecastApp:
             'forecast': monthly_forecast
         })
         
-        # Округляем до сотен тысяч
         result_df['forecast'] = result_df['forecast'].apply(
             lambda x: self.round_amount(x, 'hundreds_thousands')
         )
@@ -525,34 +590,10 @@ class ForecastApp:
         
         return result_df, stats
     
-    def select_best_model(self, models, test_data):
-        """Выбор лучшей модели на основе MAE на тестовых данных"""
-        best_mae = float('inf')
-        best_model = 'Ensemble'
-        
-        for name, forecast in models.items():
-            if name == 'Ensemble':
-                continue
-            
-            # Сравниваем с соответствующим периодом тестовых данных
-            test_period = test_data.iloc[:len(forecast)]
-            
-            if len(test_period) > 0 and len(forecast) > 0:
-                try:
-                    mae = mean_absolute_error(test_period['Sales'], forecast[:len(test_period)])
-                    if mae < best_mae:
-                        best_mae = mae
-                        best_model = name
-                except:
-                    pass
-        
-        return best_model
-    
     def update_years_table(self):
         """Обновление таблицы с данными по годам"""
         self.df_years = self.load_years_data()
         
-        # Очищаем контейнер и создаем новую таблицу
         years_container.clear()
         
         if self.df_years.empty:
@@ -569,21 +610,7 @@ class ForecastApp:
                 {'name': 'fact', 'label': 'Факт (₽)', 'field': 'fact', 'align': 'right'},
             ]
             
-            # rows = self.df_years.to_dict('records')
-
-            # Преобразуем Decimal в строку с двумя знаками для отображения
-            rows = []
-            for _, row in self.df_years.iterrows():
-                rows.append({
-                    'year': int(row['year']),
-                    'plan': float(row['plan']),  # Конвертируем для JS форматирования
-                    'fact': float(row['fact'])   # Конвертируем для JS форматирования
-                })
-            
-            # Округляем значения в таблице
-            # for row in rows:
-                # row['plan'] = self.round_amount(row['plan'], 'hundreds_thousands')
-                # row['fact'] = self.round_amount(row['fact'], 'hundreds_thousands')
+            rows = self.df_years.to_dict('records')
             
             table = ui.table(
                 columns=columns,
@@ -592,17 +619,16 @@ class ForecastApp:
                 pagination={'rowsPerPage': 10}
             ).classes('w-full')
             
-            # Форматирование чисел
             table.add_slot('body-cell-year', '''
-                <q-td key="year" :props="props" style="width: 80px; min-width: 80px;">
-                    <div class="text-center text-bold">{{ props.value }}</div>
+                <q-td key="year" :props="props" style="width: 80px; min-width: 80px; text-align: center;">
+                    <div class="text-bold">{{ props.value }}</div>
                 </q-td>
             ''')
             
             table.add_slot('body-cell-plan', '''
                 <q-td key="plan" :props="props" style="text-align: right;">
                     <div class="font-mono">
-                        {{ new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 2}).format(props.value) }}
+                        {{ new Intl.NumberFormat('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 2}).format(props.value) }}
                     </div>
                 </q-td>
             ''')
@@ -610,7 +636,7 @@ class ForecastApp:
             table.add_slot('body-cell-fact', '''
                 <q-td key="fact" :props="props" style="text-align: right;">
                     <div class="font-mono">
-                        {{ new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 2}).format(props.value) }}
+                        {{ new Intl.NumberFormat('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 2}).format(props.value) }}
                     </div>
                 </q-td>
             ''')
@@ -649,6 +675,7 @@ class ForecastApp:
         
         if self.df_sales.empty:
             forecast_container.clear()
+            direction_container.clear()
             with forecast_container:
                 ui.label('Нет данных для прогнозирования').classes('text-bold text-red')
             progress_container.clear()
@@ -656,7 +683,13 @@ class ForecastApp:
         
         await self.update_progress(20, 'Подготовка данных...')
         
-        # Восстанавливаем таблицу с годами (если она была очищена)
+        # Загружаем данные по направлениям
+        if self.df_directions.empty:
+            self.df_directions = self.load_directions_data()
+        
+        await self.update_progress(25, 'Расчет коэффициентов по направлениям...')
+        
+        # Восстанавливаем таблицу с годами
         if self.df_years.empty:
             self.update_years_table()
         
@@ -669,7 +702,7 @@ class ForecastApp:
             data = self.weekly_df
             agg = 'weekly'
             await self.update_progress(30, 'Недельный прогноз (может занять до 30 секунд)...')
-        else:  # По дням
+        else:
             data = self.daily_df
             agg = 'daily'
             await self.update_progress(30, 'Дневной прогноз...')
@@ -686,10 +719,11 @@ class ForecastApp:
             print(f"Ошибка прогноза: {e}")
             forecast_result = None
         
-        await self.update_progress(80, 'Формирование результатов...')
+        await self.update_progress(70, 'Формирование результатов...')
         
-        # Очищаем только контейнер прогноза
+        # Очищаем контейнеры
         forecast_container.clear()
+        direction_container.clear()
         
         if forecast_result is None:
             with forecast_container:
@@ -697,13 +731,15 @@ class ForecastApp:
         else:
             forecast_df, stats = forecast_result
             
+            # Разбиваем прогноз по направлениям
+            direction_forecast = self.split_forecast_by_directions(forecast_df, selected_year)
+            
+            # Отображаем общий прогноз
             with forecast_container:
                 ui.label(f'ПРОГНОЗ НА {selected_year} ГОД').classes('text-h5 text-bold text-blue mb-4')
-                
-                # Информация о модели
                 ui.label(f"Модель: {stats['model_used']}").classes('text-italic mb-2')
                 
-                # Карточки с общей статистикой (уже округлено)
+                # Карточки со статистикой
                 with ui.row().classes('w-full gap-4 mb-6'):
                     with ui.card().classes('bg-blue-1 p-4'):
                         ui.label('Общая сумма:').classes('text-bold')
@@ -717,7 +753,7 @@ class ForecastApp:
                         ui.label('Мин/Макс месяц:').classes('text-bold')
                         ui.label(f"{stats['min_month']:,.0f} / {stats['max_month']:,.0f} ₽".replace(',', ' ')).classes('text-h6 text-bold text-purple')
                 
-                # Таблица с помесячным прогнозом
+                # Таблица помесячного прогноза
                 ui.label('Помесячный прогноз:').classes('text-h6 text-bold mb-2')
                 
                 columns = [
@@ -735,15 +771,23 @@ class ForecastApp:
                 for _, row in forecast_df.iterrows():
                     month_num = row['month'].month
                     rows.append({
-                        'month': f"{months_ru[month_num]} {row['month'].year}",
+                        'month': months_ru[month_num],
                         'forecast': row['forecast']
                     })
                 
                 forecast_table = ui.table(
                     columns=columns,
                     rows=rows,
-                    pagination={'rowsPerPage': 12}
+                    pagination={'rowsPerPage': 15}
                 ).classes('w-full')
+                
+                forecast_table.add_slot('body-cell-month', '''
+                    <q-td key="month" :props="props" style="text-align: left;">
+                        <div class="text-bold">
+                            {{ props.value }}
+                        </div>
+                    </q-td>
+                ''')
                 
                 forecast_table.add_slot('body-cell-forecast', '''
                     <q-td key="forecast" :props="props" style="text-align: right;">
@@ -752,12 +796,79 @@ class ForecastApp:
                         </div>
                     </q-td>
                 ''')
-                
-                self.forecast_table = forecast_table
+            
+            # Отображаем прогноз по направлениям
+            if direction_forecast is not None and not direction_forecast.empty:
+                with direction_container:
+                    ui.label('ПРОГНОЗ ПО ТОВАРНЫМ НАПРАВЛЕНИЯМ:').classes('text-h5 text-bold text-green mb-4')
+                    
+                    # Получаем уникальные направления
+                    directions = sorted(direction_forecast['direction'].unique())
+                    
+                    # Создаем колонки для таблицы
+                    columns = [{'name': 'month', 'label': 'Месяц', 'field': 'month', 'align': 'left'}]
+                    for direction in directions:
+                        columns.append({
+                            'name': direction,
+                            'label': direction,
+                            'field': direction,
+                            'align': 'right'
+                        })
+                    
+                    # Формируем строки
+                    months_ru = {
+                        1: 'Январь', 2: 'Февраль', 3: 'Март', 4: 'Апрель',
+                        5: 'Май', 6: 'Июнь', 7: 'Июль', 8: 'Август',
+                        9: 'Сентябрь', 10: 'Октябрь', 11: 'Ноябрь', 12: 'Декабрь'
+                    }
+                    
+                    rows = []
+                    for month_num in range(1, 13):
+                        row = {'month': months_ru[month_num]}
+                        month_data = direction_forecast[direction_forecast['month'].dt.month == month_num]
+                        for direction in directions:
+                            value = month_data[month_data['direction'] == direction]['forecast'].sum()
+                            row[direction] = value if value > 0 else 0
+                        rows.append(row)
+                    
+                    # Добавляем итоговую строку
+                    total_row = {'month': 'ИТОГО:'}
+                    for direction in directions:
+                        total = direction_forecast[direction_forecast['direction'] == direction]['forecast'].sum()
+                        total_row[direction] = total
+                    rows.append(total_row)
+                    
+                    # Создаем таблицу
+                    direction_table = ui.table(
+                        columns=columns,
+                        rows=rows,
+                        pagination={'rowsPerPage': 15}
+                    ).classes('w-full')
+                    
+                    # Добавляем форматирование для колонки месяца
+                    direction_table.add_slot('body-cell-month', '''
+                        <q-td key="month" :props="props" style="text-align: left;">
+                            <div class="text-bold">
+                                {{ props.value }}
+                            </div>
+                        </q-td>
+                    ''')
+                    
+                    # Добавляем форматирование для всех числовых колонок
+                    for direction in directions:
+                        # Используем двойные фигурные скобки для экранирования в f-string
+                        direction_table.add_slot(f'body-cell-{direction}', f'''
+                            <q-td key="{direction}" :props="props" style="text-align: right;">
+                                <div class="font-mono text-bold">
+                                    {{{{ new Intl.NumberFormat('ru-RU', {{maximumFractionDigits: 0}}).format(props.value) }}}}
+                                </div>
+                            </q-td>
+                        ''')
+                    
+                    # Обновляем таблицу с итоговой строкой
+                    direction_table.rows = rows
         
         await self.update_progress(100, 'Готово!')
-        
-        # Убираем прогресс-бар через 2 секунды
         await asyncio.sleep(2)
         progress_container.clear()
     
@@ -766,21 +877,24 @@ class ForecastApp:
         ui.notify('Загрузка данных...', type='info')
         self.update_years_table()
         self.df_sales = self.load_sales_data()
+        self.df_directions = self.load_directions_data()
         
         if not self.df_sales.empty:
             self.monthly_df = self.prepare_monthly_data(self.df_sales)
             self.weekly_df = self.prepare_weekly_data(self.df_sales)
             self.daily_df = self.prepare_daily_data(self.df_sales)
-            ui.notify(f'Загружено {len(self.df_sales)} записей', type='positive')
-        else:
-            ui.notify('Нет данных о продажах', type='warning')
+            ui.notify(f'Загружено {len(self.df_sales)} записей о продажах', type='positive')
         
-        # Очищаем прогноз при загрузке новых данных
+        if not self.df_directions.empty:
+            ui.notify(f'Загружено {len(self.df_directions)} записей по направлениям', type='positive')
+        
+        # Очищаем прогнозы
         forecast_container.clear()
+        direction_container.clear()
     
     def create_ui(self):
         """Создание интерфейса"""
-        # Добавляем CSS
+        # Добавляем CSS для единого стиля таблиц
         ui.add_head_html('''
         <style>
         .font-mono {
@@ -789,7 +903,15 @@ class ForecastApp:
             letter-spacing: 0.5px;
         }
         .q-table td, .q-table th {
-            padding: 8px 12px !important;
+            padding: 12px 16px !important;
+            font-size: 14px;
+        }
+        .q-table th {
+            background-color: #f5f5f5;
+            font-weight: bold;
+        }
+        .q-table tbody tr:hover {
+            background-color: #f9f9f9;
         }
         .bg-blue-1 { background-color: #e3f2fd; }
         .bg-green-1 { background-color: #e8f5e8; }
@@ -804,7 +926,7 @@ class ForecastApp:
             ui.button('Загрузить данные', on_click=self.on_load_all_click).classes('bg-blue-500 text-white px-8 py-2')
             
             self.select_year = ui.select(
-                [2020, 2021, 2022, 2023, 2024, 2025, 2026],
+                [2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027],
                 label='Выберите год для прогноза',
                 value=2026
             ).classes('w-48')
@@ -825,9 +947,13 @@ class ForecastApp:
         global years_container
         years_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4 mb-8')
         
-        # Контейнер для прогноза
+        # Контейнер для общего прогноза
         global forecast_container
-        forecast_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
+        forecast_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4 mb-8')
+        
+        # Контейнер для прогноза по направлениям
+        global direction_container
+        direction_container = ui.column().classes('w-full max-w-4xl mx-auto mt-4')
 
 # Запуск приложения
 app = ForecastApp()
