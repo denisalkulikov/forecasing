@@ -11,6 +11,7 @@ import asyncio
 import warnings
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
 warnings.filterwarnings('ignore')
@@ -60,11 +61,16 @@ class ForecastApp:
             order by year
             """
             df = pd.read_sql(query, conn)
+
+            # Явно конвертируем в Decimal для сохранения точности
+            from decimal import Decimal
+            df['plan'] = df['plan'].apply(lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0'))
+            df['fact'] = df['fact'].apply(lambda x: Decimal(str(x)) if pd.notna(x) else Decimal('0'))
             
             # Округляем до 2 знаков после запятой
-            for col in ['plan', 'fact']:
-                if col in df.columns:
-                    df[col] = df[col].round(2)
+            # for col in ['plan', 'fact']:
+                # if col in df.columns:
+                    # df[col] = df[col].round(2)
             
             return df
         except Exception as e:
@@ -563,12 +569,21 @@ class ForecastApp:
                 {'name': 'fact', 'label': 'Факт (₽)', 'field': 'fact', 'align': 'right'},
             ]
             
-            rows = self.df_years.to_dict('records')
+            # rows = self.df_years.to_dict('records')
+
+            # Преобразуем Decimal в строку с двумя знаками для отображения
+            rows = []
+            for _, row in self.df_years.iterrows():
+                rows.append({
+                    'year': int(row['year']),
+                    'plan': float(row['plan']),  # Конвертируем для JS форматирования
+                    'fact': float(row['fact'])   # Конвертируем для JS форматирования
+                })
             
             # Округляем значения в таблице
-            for row in rows:
-                row['plan'] = self.round_amount(row['plan'], 'hundreds_thousands')
-                row['fact'] = self.round_amount(row['fact'], 'hundreds_thousands')
+            # for row in rows:
+                # row['plan'] = self.round_amount(row['plan'], 'hundreds_thousands')
+                # row['fact'] = self.round_amount(row['fact'], 'hundreds_thousands')
             
             table = ui.table(
                 columns=columns,
@@ -587,7 +602,7 @@ class ForecastApp:
             table.add_slot('body-cell-plan', '''
                 <q-td key="plan" :props="props" style="text-align: right;">
                     <div class="font-mono">
-                        {{ new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 0}).format(props.value) }}
+                        {{ new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 2}).format(props.value) }}
                     </div>
                 </q-td>
             ''')
@@ -595,7 +610,7 @@ class ForecastApp:
             table.add_slot('body-cell-fact', '''
                 <q-td key="fact" :props="props" style="text-align: right;">
                     <div class="font-mono">
-                        {{ new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 0}).format(props.value) }}
+                        {{ new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 2}).format(props.value) }}
                     </div>
                 </q-td>
             ''')
